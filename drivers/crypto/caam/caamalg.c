@@ -64,6 +64,10 @@
 /* max IV is max of AES_BLOCK_SIZE, DES3_EDE_BLOCK_SIZE */
 #define CAAM_MAX_IV_LENGTH		16
 
+#define AES_XTS_MIN_KEY_SIZE 32
+#define AES_XTS_MAX_KEY_SIZE 64
+
+
 /* length of descriptors text */
 #define DESC_AEAD_BASE			(4 * CAAM_CMD_SZ)
 #define DESC_AEAD_ENC_LEN		(DESC_AEAD_BASE + 16 * CAAM_CMD_SZ)
@@ -534,6 +538,155 @@ static int aead_setkey(struct crypto_aead *aead,
 badkey:
 	crypto_aead_set_flags(aead, CRYPTO_TFM_RES_BAD_KEY_LEN);
 	return -EINVAL;
+}
+
+
+static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
+			     	 const u8 *key, unsigned int keylen)
+{
+	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
+	struct ablkcipher_tfm *tfm = &ablkcipher->base.crt_ablkcipher;
+	struct device *jrdev = ctx->jrdev;
+	int ret = 0;
+	u32 *key_jump_cmd, *jump_cmd;
+	u32 *desc;
+	/*the size of the sector as said in the dm_crypt it is 512B*/
+	long sector_size = 512 ;
+	
+	/*check if key size is valid */
+	if (keylen != 32 && keylen != 64 )
+	{
+		dev_err(jrdev, "key size mismatch\n");
+		return -ENOMEM;
+	}
+	
+	memcpy(ctx->key, key, keylen);
+	ctx->key_dma = dma_map_single(jrdev, ctx->key, keylen,
+					      DMA_TO_DEVICE);
+	if (dma_mapping_error(jrdev, ctx->key_dma)) 
+	{
+			dev_err(jrdev, "unable to map key i/o memory\n");
+			return -ENOMEM;
+	}
+		ctx->enckeylen = keylen;
+
+		/* ablkcipher_encrypt shared descriptor */
+		desc = ctx->sh_desc_enc;
+		init_sh_desc(desc, HDR_SHARE_SERIAL);
+		/* Skip if already shared */
+		key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+					   JUMP_COND_SHRD);
+		/* Load class1 keys only */
+		if (keylen == 32)
+		{
+			/*both keys  go into the Key register with offset 0 and 16*/
+			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen,
+						  ctx->enckeylen, CLASS_1 |
+						  KEY_DEST_CLASS_REG);
+			
+		}
+		else if (keylen == 64)
+		{
+			/*aes key goes into the key register*/
+			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen/2,
+									  ctx->enckeylen/2, CLASS_1 |
+									  KEY_DEST_CLASS_REG);
+			/*tweal key goes into context register with offset 0 */
+			append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
+							   LDST_CLASS_1_CCB | (ctx->enckeylen/2));
+			append_data(desc,(void *)(ctx->key+ctx->enckeylen/2),ctx->enckeylen/2);
+			
+		}
+		set_jump_tgt_here(desc, key_jump_cmd);
+
+		/* Propagate errors from shared to job descriptor */
+		append_cmd(desc, SET_OK_NO_PROP_ERRORS | CMD_LOAD);
+		
+		/*prepare the load command for the sector size with index 40 bytes (0x28)*/
+		append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
+									   LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
+		append_data(desc,(void*)&sector_size,8);
+		
+		/*create sequence for loading the sector index*/
+		append_cmd(desc,CMD_SEQ_LOAD|LDST_SRCDST_BYTE_CONTEXT|LDST_CLASS_1_CCB|
+				(0x20<<LDST_OFFSET_SHIFT)|8);
+			
+		/* Load operation */
+		append_operation(desc, ctx->class1_alg_type |
+									 OP_ALG_AS_INITFINAL | OP_ALG_ENCRYPT);
+
+		/* Perform operation */
+		ablkcipher_append_src_dst(desc);
+		
+		ctx->sh_desc_enc_dma = dma_map_single(jrdev, desc,
+						      desc_bytes(desc),
+						      DMA_TO_DEVICE);
+		if (dma_mapping_error(jrdev, ctx->sh_desc_enc_dma)) {
+			dev_err(jrdev, "unable to map shared descriptor\n");
+			return -ENOMEM;
+		}
+		
+		
+		/* ablkcipher_decrypt shared descriptor */
+		desc = ctx->sh_desc_dec;
+
+		init_sh_desc(desc, HDR_SHARE_SERIAL);
+		/* Skip if already shared */
+		key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
+						   JUMP_COND_SHRD);
+		
+		/* Load class1 key only */
+		if (keylen == 32)
+		{
+			/*both keys  go into the Key register with offset 0 and 16*/
+			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen,
+									ctx->enckeylen, CLASS_1 |
+											KEY_DEST_CLASS_REG);
+					
+		}
+		else if (keylen == 64)
+		{
+			/*aes key goes into the key register*/
+			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen/2,
+											  ctx->enckeylen/2, CLASS_1 |
+											  KEY_DEST_CLASS_REG);
+			/*tweal key goes into context register with offset 0 */
+			append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
+						LDST_CLASS_1_CCB | (ctx->enckeylen/2));
+			append_data(desc,(void *)(ctx->key+ctx->enckeylen/2),ctx->enckeylen/2);
+					
+		}
+		set_jump_tgt_here(desc, key_jump_cmd);
+		
+				
+		jump_cmd = append_jump(desc, JUMP_TEST_ALL);
+		set_jump_tgt_here(desc, key_jump_cmd);
+		append_cmd(desc, SET_OK_NO_PROP_ERRORS | CMD_LOAD);
+		set_jump_tgt_here(desc, jump_cmd);
+		
+		/*Load sector size with index 40 bytes (0x28)*/
+		append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
+											   LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
+		append_data(desc,(void*)&sector_size,8);
+		/*Load operation*/
+		append_dec_op1(desc, ctx->class1_alg_type);
+		/* Perform operation */
+		ablkcipher_append_src_dst(desc);
+
+		/* Wait for key to load before allowing propagating error */
+		append_dec_shr_done(desc);
+
+		ctx->sh_desc_dec_dma = dma_map_single(jrdev, desc,
+							      desc_bytes(desc),
+							      DMA_TO_DEVICE);
+		if (dma_mapping_error(jrdev, ctx->sh_desc_enc_dma)) 
+		{
+			dev_err(jrdev, "unable to map shared descriptor\n");
+			return -ENOMEM;
+		}
+
+			return ret;
+		
 }
 
 static int ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
@@ -2022,6 +2175,22 @@ static struct caam_alg_template driver_algs[] = {
 		.class1_alg_type = OP_ALG_ALGSEL_AES | OP_ALG_AAI_CBC,
 	},
 	{
+			.name = "xts(aes)",
+			.driver_name = "xts-aes-caam",
+			.blocksize = AES_BLOCK_SIZE,
+			.type = CRYPTO_ALG_TYPE_ABLKCIPHER,
+			.template_ablkcipher = {
+				.setkey = xts_ablkcipher_setkey,
+				.encrypt = ablkcipher_encrypt,
+				.decrypt = ablkcipher_decrypt,
+				.geniv = "eseqiv",
+				.min_keysize = AES_XTS_MIN_KEY_SIZE,
+				.max_keysize = AES_XTS_MAX_KEY_SIZE,
+				.ivsize = AES_BLOCK_SIZE,
+				},
+			.class1_alg_type = OP_ALG_ALGSEL_AES | OP_ALG_AAI_XTS,
+	},
+	{
 		.name = "cbc(des3_ede)",
 		.driver_name = "cbc-3des-caam",
 		.blocksize = DES3_EDE_BLOCK_SIZE,
@@ -2188,6 +2357,7 @@ static struct caam_crypto_alg *caam_alg_alloc(struct device *ctrldev,
 
 static int __init caam_algapi_init(void)
 {
+	printk("John was jere!!!\n");
 	struct device_node *dev_node;
 	struct platform_device *pdev;
 	struct device *ctrldev;
