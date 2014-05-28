@@ -66,7 +66,7 @@
 
 #define AES_XTS_MIN_KEY_SIZE 32
 #define AES_XTS_MAX_KEY_SIZE 64
-
+#define AES_XTS_IV_SIZE 8
 
 /* length of descriptors text */
 #define DESC_AEAD_BASE			(4 * CAAM_CMD_SZ)
@@ -550,8 +550,10 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 	int ret = 0;
 	u32 *key_jump_cmd, *jump_cmd;
 	u32 *desc;
-	/*the size of the sector as said in the dm_crypt it is 512B*/
+	/*the size of the sector as said in the dm_crypt  is 512B*/
 	long sector_size = 512 ;
+	long sector_index = 0 ; 
+	
 	
 	/*check if key size is valid */
 	if (keylen != 32 && keylen != 64 )
@@ -572,29 +574,32 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 
 		/* ablkcipher_encrypt shared descriptor */
 		desc = ctx->sh_desc_enc;
-		init_sh_desc(desc, HDR_SHARE_SERIAL);
+		/*Shared descriptor will save and restore context*/
+		init_sh_desc(desc, HDR_SHARE_SERIAL|HDR_SAVECTX);
 		/* Skip if already shared */
 		key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
 					   JUMP_COND_SHRD);
 		/* Load class1 keys only */
+		
 		if (keylen == 32)
 		{
 			/*both keys  go into the Key register with offset 0 and 16*/
 			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen,
 						  ctx->enckeylen, CLASS_1 |
-						  KEY_DEST_CLASS_REG);
-			
+						  KEY_DEST_CLASS_REG);	
 		}
 		else if (keylen == 64)
 		{
+			
 			/*aes key goes into the key register*/
 			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen/2,
 									  ctx->enckeylen/2, CLASS_1 |
 									  KEY_DEST_CLASS_REG);
-			/*tweal key goes into context register with offset 0 */
+			/*tweak key goes into context register with offset 0 */
 			append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
 							   LDST_CLASS_1_CCB | (ctx->enckeylen/2));
 			append_data(desc,(void *)(ctx->key+ctx->enckeylen/2),ctx->enckeylen/2);
+			
 			
 		}
 		set_jump_tgt_here(desc, key_jump_cmd);
@@ -604,12 +609,20 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		
 		/*prepare the load command for the sector size with index 40 bytes (0x28)*/
 		append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
-									   LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
+													   LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
 		append_data(desc,(void*)&sector_size,8);
 		
+		append_cmd(desc,CMD_LOAD|IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT|
+												LDST_CLASS_1_CCB| (0x20<<LDST_OFFSET_SHIFT)|8);
+		append_data(desc,(void*)&sector_index,8);
+				
 		/*create sequence for loading the sector index*/
+		/* Upper 8B of IV - will be overwritten since they're not used */
 		append_cmd(desc,CMD_SEQ_LOAD|LDST_SRCDST_BYTE_CONTEXT|LDST_CLASS_1_CCB|
-				(0x20<<LDST_OFFSET_SHIFT)|8);
+		                               (0x20<<LDST_OFFSET_SHIFT)|8);
+		/* Lower 8B of IV - these will be used */
+		append_cmd(desc,CMD_SEQ_LOAD|LDST_SRCDST_BYTE_CONTEXT|LDST_CLASS_1_CCB|
+		                               (0x20<<LDST_OFFSET_SHIFT)|8);
 			
 		/* Load operation */
 		append_operation(desc, ctx->class1_alg_type |
@@ -630,7 +643,7 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		/* ablkcipher_decrypt shared descriptor */
 		desc = ctx->sh_desc_dec;
 
-		init_sh_desc(desc, HDR_SHARE_SERIAL);
+		init_sh_desc(desc, HDR_SHARE_SERIAL|HDR_SAVECTX);
 		/* Skip if already shared */
 		key_jump_cmd = append_jump(desc, JUMP_JSL | JUMP_TEST_ALL |
 						   JUMP_COND_SHRD);
@@ -638,6 +651,7 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		/* Load class1 key only */
 		if (keylen == 32)
 		{
+			
 			/*both keys  go into the Key register with offset 0 and 16*/
 			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen,
 									ctx->enckeylen, CLASS_1 |
@@ -646,14 +660,16 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		}
 		else if (keylen == 64)
 		{
+			
 			/*aes key goes into the key register*/
 			append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen/2,
 											  ctx->enckeylen/2, CLASS_1 |
 											  KEY_DEST_CLASS_REG);
-			/*tweal key goes into context register with offset 0 */
+			/*tweak key goes into context register with offset 0 */
 			append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
 						LDST_CLASS_1_CCB | (ctx->enckeylen/2));
 			append_data(desc,(void *)(ctx->key+ctx->enckeylen/2),ctx->enckeylen/2);
+			
 					
 		}
 		set_jump_tgt_here(desc, key_jump_cmd);
@@ -666,8 +682,23 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		
 		/*Load sector size with index 40 bytes (0x28)*/
 		append_cmd(desc, CMD_LOAD |IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT |
-											   LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
+								LDST_CLASS_1_CCB |(0x28<<LDST_OFFSET_SHIFT)| 8);
 		append_data(desc,(void*)&sector_size,8);
+	
+		/*create sequence for loading the sector index*/
+		append_cmd(desc,CMD_LOAD|IMMEDIATE | LDST_SRCDST_BYTE_CONTEXT|
+						LDST_CLASS_1_CCB| (0x20<<LDST_OFFSET_SHIFT)|8);
+		append_data(desc,(void*)&sector_index,8);
+		
+		/*Upper 8B of IV - will be overwritten since they're not used */
+		append_cmd(desc,CMD_SEQ_LOAD|LDST_SRCDST_BYTE_CONTEXT|LDST_CLASS_1_CCB|
+		                               (0x20<<LDST_OFFSET_SHIFT)|8);
+
+		/* Lower 8B of IV - these will be used */
+		append_cmd(desc,CMD_SEQ_LOAD|LDST_SRCDST_BYTE_CONTEXT|LDST_CLASS_1_CCB|
+		                               (0x20<<LDST_OFFSET_SHIFT)|8);
+	
+		
 		/*Load operation*/
 		append_dec_op1(desc, ctx->class1_alg_type);
 		/* Perform operation */
@@ -1224,6 +1255,8 @@ static void init_aead_giv_job(u32 *sh_desc, dma_addr_t ptr,
 /*
  * Fill in ablkcipher job descriptor
  */
+
+
 static void init_ablkcipher_job(u32 *sh_desc, dma_addr_t ptr,
 				struct ablkcipher_edesc *edesc,
 				struct ablkcipher_request *req,
@@ -1256,7 +1289,7 @@ static void init_ablkcipher_job(u32 *sh_desc, dma_addr_t ptr,
 		sec4_sg_index += (iv_contig ? 0 : 1) + edesc->src_nents;
 		in_options = LDST_SGF;
 	}
-	append_seq_in_ptr(desc, src_dma, req->nbytes + ivsize, in_options);
+	append_seq_in_ptr(desc, src_dma, req->nbytes+ivsize, in_options);
 
 	if (likely(req->src == req->dst)) {
 		if (!edesc->src_nents && iv_contig) {
@@ -1706,6 +1739,9 @@ static struct ablkcipher_edesc *ablkcipher_edesc_alloc(struct ablkcipher_request
 	return edesc;
 }
 
+
+
+
 static int ablkcipher_encrypt(struct ablkcipher_request *req)
 {
 	struct ablkcipher_edesc *edesc;
@@ -1715,7 +1751,7 @@ static int ablkcipher_encrypt(struct ablkcipher_request *req)
 	bool iv_contig;
 	u32 *desc;
 	int ret = 0;
-
+	
 	/* allocate extended descriptor */
 	edesc = ablkcipher_edesc_alloc(req, DESC_JOB_IO_LEN *
 				       CAAM_CMD_SZ, &iv_contig);
@@ -1743,6 +1779,7 @@ static int ablkcipher_encrypt(struct ablkcipher_request *req)
 	return ret;
 }
 
+
 static int ablkcipher_decrypt(struct ablkcipher_request *req)
 {
 	struct ablkcipher_edesc *edesc;
@@ -1752,7 +1789,7 @@ static int ablkcipher_decrypt(struct ablkcipher_request *req)
 	bool iv_contig;
 	u32 *desc;
 	int ret = 0;
-
+	
 	/* allocate extended descriptor */
 	edesc = ablkcipher_edesc_alloc(req, DESC_JOB_IO_LEN *
 				       CAAM_CMD_SZ, &iv_contig);
