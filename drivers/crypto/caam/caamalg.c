@@ -58,7 +58,7 @@
  * crypto alg
  */
 
-#define DEBUG1
+
 
 #define CAAM_CRA_PRIORITY		3000
 /* max key is sum of AES_MAX_KEY_SIZE, max split key size */
@@ -69,7 +69,7 @@
 
 #define AES_XTS_MIN_KEY_SIZE 32
 #define AES_XTS_MAX_KEY_SIZE 64
-#define AES_XTS_IV_SIZE 8
+
 
 /* length of descriptors text */
 #define DESC_AEAD_BASE			(4 * CAAM_CMD_SZ)
@@ -87,7 +87,7 @@
 					 CAAM_MAX_KEY_SIZE)
 #define DESC_MAX_USED_LEN		(DESC_MAX_USED_BYTES / CAAM_CMD_SZ)
 
-#ifdef DEBUG1
+#ifdef DEBUG
 /* for print_hex_dumps with line references */
 #define xstr(s) str(s)
 #define str(s) #s
@@ -555,7 +555,7 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 	u32 *desc;
 	/*the size of the sector as said in the dm_crypt  is 512B*/
 	u64 sector_size = 512 ;
-	
+	//printk("xts caam\n");
 	/*check if key size is valid */
 	if (keylen != 32 && keylen != 64 )
 	{
@@ -583,7 +583,7 @@ static int xts_ablkcipher_setkey(struct crypto_ablkcipher *ablkcipher,
 		/* Load class1 keys only */
 		
 		
-		/*keylen 32 key go into key register
+		/*keylen 32 keys go into key register
 		keylen 64 aes key goes into key register tweak key goes into first 4 word of COntext Register*/
 		append_key_as_imm(desc, (void *)ctx->key, ctx->enckeylen,
 						  ctx->enckeylen, CLASS_1 |
@@ -1726,6 +1726,13 @@ static int ablkcipher_encrypt(struct ablkcipher_request *req)
 	/* Create and submit job descriptor*/
 	init_ablkcipher_job(ctx->sh_desc_enc,
 		ctx->sh_desc_enc_dma, edesc, req, iv_contig);
+	if (i == 0 )
+	{
+		printk("Licenta 2014 Criptare\n");
+		
+	}
+	i++;
+	i%=7;
 #ifdef DEBUG1
 	if (i==0)
 	{
@@ -1745,7 +1752,7 @@ static int ablkcipher_encrypt(struct ablkcipher_request *req)
 		ablkcipher_unmap(jrdev, edesc, req);
 		kfree(edesc);
 	}
-
+	
 	return ret;
 }
 
@@ -1760,6 +1767,15 @@ static int ablkcipher_decrypt(struct ablkcipher_request *req)
 	u32 *desc;
 	int ret = 0;
 	static int j ; 
+	
+	
+	if (j == 0 )
+		{
+			printk("Licenta 2014 Decriptare\n");
+			
+		}
+	j++;
+				j%=7;
 	/* allocate extended descriptor */
 	edesc = ablkcipher_edesc_alloc(req, DESC_JOB_IO_LEN *
 				       CAAM_CMD_SZ, &iv_contig);
